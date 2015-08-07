@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# backup-to-external
+# Copyright (c) 2015 Chris Barber
+
+program="backup-to-external"
+user_config=~/.backup-to-external
+backing_up_file=/tmp/backing-up
+last_backup_file=/var/run/last-backup
+log_file=/tmp/backup-to-external_$(date +%Y-%m-%d).log
+power_off_afterwards=1
+send_email=1
+power_on_timeout=120
+start_time=$(date +"%s")
+
+echo -e "$program, version 1.0\n"
+
+show_help() {
+	echo "Usage: $program [init]"
+	echo ""
+	echo "  init        initializes a config file in the user's home dir"
+	echo ""
+	echo "  -h, --help  show the help screen"
+	echo "  --no-email  don't send an e-mail when finished"
+	if [ "$#" -gt 0 ]; then
+		echo ""
+		while (( "$#" )); do
+			echo $1
+			shift
+		done
+	fi
+}
+
+init_config() {
+	echo -e "Initializing default config file..."
+
+	if [ -e "$user_config" ]; then
+		echo -e "Config file $user_config already exists\nAborting"
+		exit 1
+	fi
+
+	cat > $user_config <<EOL
+ezoutlet_host="<hostname or ip>"
+
+source_dir="/path/to/source"
+
+dest_disk="/dev/sd?#"
+dest_mount="/path/to/mount"
+dest_dir="/path/to/mount/dest"
+
+smtp_url="smtps://host:port"
+smtp_user="user@domain.com"
+smtp_pass="secret"
+
+email_from="user@domain.com(backup-to-external)"
+email_to="user@domain.com"
+email_subject_prefix="[backup to external]"
+EOL
+
+	echo -e "Created default config: $user_config"
+}
+
+load_config() {
+	local config_loaded=0
+
+	if [ -e "/etc/backup-to-external" ]; then
+		log "Loading global config: /etc/backup-to-external"
+		source /etc/backup-to-external
+		config_loaded=1
+	fi
+
+	if [ -e "$user_config" ]; then
+		log "Loading user config: ~/.backup-to-external"
+		source ~/.backup-to-external
+		config_loaded=1
+	fi
+
+	if [ $config_loaded = 0 ]; then
+		echo "No config file found!"
+		echo "Run \"$program init\" to create a default config file in your home directory."
+		exit 1
+	fi
+
+	if [ "$ezoutlet_host" = "" ]; then
+		echo "Invalid config setting: ezoutlet_host"
+		echo "Add the following to the $user_config config file:"
+		echo "  ezoutlet_host=\"<hostname or ip>\""
+		exit 1
+	fi
+
+	if [ "$source_dir" = "" ]; then
+		echo "Invalid config setting: source_dir"
+		echo "Add the following to the $user_config config file:"
+		echo "  source_dir=\"/path/to/source\""
+		exit 1
+	fi
+
+	if [ ! -e $source_dir ]; then
+		echo "Invalid config setting: source_dir"
+		echo "Source directory does not exist: $source_dir"
+		exit 1
+	fi
+
+	if [ "$dest_disk" = "" ]; then
+		echo "Invalid config setting: dest_disk"
+		echo "Add the following to the $user_config config file:"
+		echo "  dest_disk=\"/dev/sd?#\""
+		echo "Where ? is the device (i.e. A, B, C, D, etc) and # is the drive number"
+		exit 1
+	fi
+
+	if [ "$dest_disk" = "" ]; then
+		echo "Invalid config setting: dest_mount"
+		echo "Add the following to the $user_config config file:"
+		echo "  dest_mount=\"/path/to/mount\""
+		exit 1
+	fi
+
+	if [ "$dest_dir" = "" ]; then
+		echo "Invalid config setting: dest_dir"
+		echo "Add the following to the $user_config config file:"
+		echo "  dest_dir=\"/path/to/mount/dest\""
+		exit 1
+	fi
+
+	if [ "$smtp_url" = "" ]; then
+		echo "Invalid config setting: smtp_url"
+		echo "Add the following to the $user_config config file:"
+		echo "  smtp_url=\"smtps://host:port\""
+		exit 1
+	fi
+
+	if [ "$smtp_user" = "" ]; then
+		echo "Invalid config setting: smtp_user"
+		echo "Add the following to the $user_config config file:"
+		echo "  smtp_user=\"user@domain.com\""
+		exit 1
+	fi
+
+	if [ "$email_from" = "" ]; then
+		echo "Invalid config setting: email_from"
+		echo "Add the following to the $user_config config file:"
+		echo "  email_from=\"user@domain.com(Username)\""
+		exit 1
+	fi
+
+	if [ "$email_to" = "" ]; then
+		echo "Invalid config setting: email_to"
+		echo "Add the following to the $user_config config file:"
+		echo "  smtp_user=\"user@domain.com\""
+		exit 1
+	fi
+}
+
+log() {
+	echo "$1" >> $log_file
+	echo "$1"
+}
+
+finish() {
+	# cleanup
+	log "Removing $backing_up_file"
+	rm -f $backing_up_file
+
+	log "Touching $last_backup_file"
+	touch $last_backup_file
+
+	local end_time=$(date +"%s")
+	local delta=$(($end_time-$start_time))
+	log "Run time: $(($delta / 60)) minutes and $(($delta % 60)) seconds"
+
+	local subject="Backup Completed!"
+	local ret_code=0
+
+	while (( "$#" )); do
+		log "$1"
+		subject="Backup FAILED!"
+		ret_code=1
+		shift
+	done
+
+	# turn off the ezoutlet
+	if [ $power_off_afterwards = 1 ]; then
+		local ezoutlet_status=$(curl -s http://$ezoutlet_host/socket.cgi | head -c 1)
+		if [[ $ezoutlet_status = 1 ]]; then
+			log "Turning off ezoutlet"
+			curl -s http://$ezoutlet_host/invert.cgi > /dev/null
+		elif [[ $ezoutlet_status = 0 ]]; then
+			log "ezoutlet was already off!"
+		else
+			log "Failed to get outlet status!"
+			log $ezoutlet_status
+		fi
+	fi
+
+	if [[ $send_email = 1 ]]; then
+		if [ "$email_subject_prefix" != "" ]; then
+			subject="$email_subject_prefix $subject"
+		fi
+
+		# send the email
+		echo "Sending email: $subject"
+
+		cat $log_file | mailx \
+			-v \
+			-S smtp=$smtp_url \
+			-S smtp-auth=login \
+			-S smtp-auth-user=$smtp_user \
+			-S smtp-auth-password=$smtp_pass \
+			-S ssl-verify=ignore \
+			-S from="$email_from" \
+			-s "$subject" \
+			"$email_to"
+	fi
+
+	echo "Removing $log_file"
+	rm -f $log_file
+
+	echo "Exiting with code $ret_code"
+	exit $ret_code
+}
+
+turn_on_external() {
+	local ezoutlet_status=$(curl -s http://$ezoutlet_host/socket.cgi | head -c 1)
+	if [[ $ezoutlet_status = 0 ]]; then
+		log "ezoutlet is off, turning on"
+		curl -s http://$ezoutlet_host/invert.cgi > /dev/null
+	elif [[ $ezoutlet_status = 1 ]]; then
+		power_off_afterwards=0
+		log "ezoutlet already on, leaving powered on after finished"
+	else
+		finish "Failed to get outlet status!" $ezoutlet_status
+	fi
+}
+
+wait_for_drive() {
+ 	found=0
+	for ((tries=1 ; tries <= $power_on_timeout; tries++ )); do
+		echo "Checking $dest_disk... $tries/$power_on_timeout"
+		if [ -e "$dest_disk" ]; then
+			found=1
+			break
+		else
+			sleep 1
+		fi
+	done
+
+	if [[ $found = 0 ]]; then
+		finish "Error: $dest_disk never showed up!"
+	fi
+}
+
+main() {
+	# check command line args
+	while (( "$#" )); do
+		if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+			show_help
+			exit 0
+		fi
+		if [ "$1" = "init" ]; then
+			init_config
+			exit 0
+		fi
+		if [ "$1" = "--no-email" ]; then
+			send_email=0
+		fi
+		shift
+	done
+
+	# load the config
+	load_config
+
+	rm -f $log_file
+	touch $log_file
+
+	log "Starting backup!"
+
+	log "Touching $backing_up_file"
+	touch $backing_up_file
+
+	# turn on the external drive
+	turn_on_external
+
+	# wait for the drive to show up
+	wait_for_drive
+
+	log "Mounting $dest_disk to $dest_mount..."
+	mount $dest_disk $dest_mount
+
+	if [[ $? != 0 ]]; then
+		finish "Failed to mount $dest_disk to $dest_mount"
+	fi
+
+	# wait a few seconds for the drive to mount
+	sleep 10
+
+	local error=""
+
+	log "Backing up $source_dir to $dest_dir..."
+	rsync -av --delete $source_dir/ $dest_dir/ | tee --append $log_file
+	if [[ $? != 0 ]]; then
+		error="rsync finished with errors"
+	else
+		log "rsync completed"
+	fi
+
+	log "Unmounting $dest_mount..."
+	umount $dest_mount
+
+	# wrap it up
+	if [ "$error" = "" ]; then
+		finish
+	else
+		finish $error
+	fi
+}
+
+main $@
